@@ -53,4 +53,39 @@ describe('AuthController', () => {
       expect(result).toEqual(mockUser);
     });
   });
+
+  describe('validateToken', () => {
+    it('should return userId, email and role from the authenticated user', () => {
+      const mockRequest = {
+        user: {
+          id: 'uuid-123',
+          email: 'test@example.com',
+          role: 'buyer',
+        },
+      } as unknown as import('express').Request;
+
+      const result = authController.validateToken(mockRequest);
+
+      expect(result).toEqual({
+        userId: 'uuid-123',
+        email: 'test@example.com',
+        role: 'buyer',
+      });
+    });
+
+    it('should map id to userId correctly', () => {
+      const mockRequest = {
+        user: {
+          id: 'another-uuid-456',
+          email: 'other@example.com',
+          role: 'seller',
+        },
+      } as unknown as import('express').Request;
+
+      const result = authController.validateToken(mockRequest);
+
+      expect(result.userId).toBe('another-uuid-456');
+      expect(result).not.toHaveProperty('id');
+    });
+  });
 });

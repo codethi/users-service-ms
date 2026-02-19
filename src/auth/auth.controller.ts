@@ -1,4 +1,13 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Req,
+} from '@nestjs/common';
+import type { Request } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
@@ -20,5 +29,15 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   async login(@Body() dto: LoginDto): Promise<{ user: User; token: string }> {
     return await this.authService.login(dto);
+  }
+
+  @Get('validate-token')
+  validateToken(@Req() req: Request) {
+    const user = req.user as { id: string; email: string; role: string };
+    return {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+    };
   }
 }
