@@ -10,9 +10,14 @@
 
 ## 1. Objetivo
 
-Finalizar a integração entre o `users-service` e o `api-gateway`, adicionando os endpoints auxiliares necessários no `users-service` (validação de token, health check e Swagger) e verificando que o fluxo completo de autenticação e consulta de usuários funciona de ponta a ponta através do gateway.
+Finalizar a integração entre o `users-service` e o `api-gateway`, em duas frentes:
 
-Esta spec NÃO altera o mecanismo de proxy, guards ou circuit breaker do gateway — esses já estão implementados e funcionais. Também NÃO implementa session management.
+1. **users-service:** adicionar os endpoints auxiliares necessários (validação de token, health check e Swagger)
+2. **api-gateway:** refatorar o roteamento de `/auth/*` e `/users/*` para utilizar o `ProxyService` existente (com circuit breaker, retry, timeout e repasse fiel de erros 4xx), substituindo o `AuthController`/`AuthService` legados que fazem chamadas HTTP diretas e engoliam erros do backend
+
+O padrão correto já foi implementado na integração do `products-service` (`ProductsController` usa `ProxyService.proxyRequest()` para todas as rotas). Esta spec aplica o mesmo padrão ao `users-service`.
+
+Esta spec NÃO altera o `ProxyService`, `RetryService` ou `CircuitBreakerService` — esses já estão corrigidos para repassar erros 4xx. Também NÃO implementa session management.
 
 ---
 
@@ -45,10 +50,11 @@ O `users-service` já possui (specs 01 a 05):
 
 O `api-gateway` já possui:
 
-- `ProxyService` com circuit breaker, retry com backoff exponencial e timeout configuráveis
+- `ProxyService` com circuit breaker, retry com backoff exponencial e timeout configuráveis — já corrigido para repassar erros 4xx sem retry/circuit breaker
 - `serviceConfig` com `users.url` apontando para `process.env.USERS_SERVICE_URL || 'http://localhost:3000'`
-- `AuthController` com `POST /auth/login` e `POST /auth/register` que delegam para o `AuthService`
-- `AuthService` que faz chamadas HTTP diretas ao `users-service` para login e registro
+- `ProductsController` (`api-gateway/src/products/`) que roteia `/products/*` via `ProxyService.proxyRequest()` — **padrão de referência**
+- `AuthController` com `POST /auth/login` e `POST /auth/register` que delegam para o `AuthService` — **PROBLEMA: contorna o ProxyService**
+- `AuthService` que faz chamadas HTTP diretas ao `users-service` para login e registro — **PROBLEMA: engole erros 4xx do backend** (ex: 409 Conflict vira 401 genérico)
 - `JwtAuthGuard` com suporte a `@Public()` para rotas públicas
 - `RoleGuard` para autorização baseada em roles
 - `HealthCheckService` que chama `GET /health` em cada microserviço para verificar disponibilidade
@@ -57,6 +63,7 @@ O `api-gateway` já possui:
 - CORS configurado com header `Authorization` na lista de `allowedHeaders`
 - `.env` com `USERS_SERVICE_URL=http://localhost:3000`
 - O `ProxyService` já repassa headers (incluindo `Authorization`) e injeta headers `x-user-id`, `x-user-email`, `x-user-role` nas requisições
+- **Não possui** controller que exponha rotas `/users/*` via `ProxyService`
 
 ### 2.3 Lacunas Identificadas
 
@@ -65,6 +72,9 @@ O `api-gateway` já possui:
 | Não existe `GET /auth/validate-token` | users-service | O gateway não consegue validar tokens diretamente contra o serviço emissor |
 | Não existe `GET /health` | users-service | O `HealthCheckService` do gateway retorna `unhealthy` para o users-service |
 | Swagger não configurado | users-service | Sem documentação interativa para desenvolvimento e debug |
+| Rotas `/auth/*` contornam o `ProxyService` | api-gateway | Sem circuit breaker, retry ou timeout para chamadas ao users-service; erros 4xx são engolidos |
+| `AuthService` engole erros do backend | api-gateway | 409 Conflict no registro vira 401 genérico; 401 no login perde a mensagem original |
+| Não existem rotas `/users/*` no gateway | api-gateway | `GET /users/profile`, `/users/sellers`, `/users/:id` não são roteados pelo gateway |
 
 ---
 
@@ -148,39 +158,87 @@ USERS_SERVICE_URL=http://localhost:3000
 
 **Status:** Já configurado — apenas verificar que está presente e correto.
 
-### RF-05: Proxy de Rotas `/auth/*` e `/users/*`
+### RF-05: Refatoração — Rotear `/auth/*` e `/users/*` via ProxyService
 
-O `ProxyService` do gateway deve encaminhar corretamente as seguintes rotas para o `users-service`:
+#### Problema atual
 
-| Rota no Gateway | Método | Destino no users-service |
-|-----------------|--------|--------------------------|
-| `/auth/register` | POST | `http://localhost:3000/auth/register` |
-| `/auth/login` | POST | `http://localhost:3000/auth/login` |
-| `/auth/validate-token` | GET | `http://localhost:3000/auth/validate-token` |
-| `/users/profile` | GET | `http://localhost:3000/users/profile` |
-| `/users/sellers` | GET | `http://localhost:3000/users/sellers` |
-| `/users/:id` | GET | `http://localhost:3000/users/:id` |
+O `AuthController` do gateway (`api-gateway/src/auth/controllers/auth.controller.ts`) delega para um `AuthService` (`api-gateway/src/auth/service/auth.service.ts`) que faz chamadas HTTP diretas ao `users-service` usando `HttpService`, **contornando toda a infraestrutura de resiliência** do `ProxyService` (circuit breaker, retry, timeout, fallback).
 
-**Status:** O mecanismo de proxy já existe — verificar que as rotas acima são encaminhadas corretamente com os headers necessários.
+Além disso, o `AuthService` captura **todos** os erros do backend com `catch` genérico e lança `UnauthorizedException` com mensagens fixas, **engolindo** os erros reais do `users-service`. Exemplos:
+- Um `409 Conflict` na rota de registro (email duplicado) vira `401 "Registration failed"`
+- Um `401 Unauthorized` no login (credenciais inválidas) vira `401 "Invalid login credentials"` sem o body original
 
-### RF-06: Repasse do Header Authorization
+#### Solução
+
+Criar um `UsersController` no gateway que utilize `ProxyService.proxyRequest('users', ...)` para **todas** as rotas de autenticação e usuários, seguindo o mesmo padrão do `ProductsController` (`api-gateway/src/products/products.controller.ts`) e `ProductsModule` (`api-gateway/src/products/products.module.ts`).
+
+As camadas de resiliência do `ProxyService` já estão corrigidas para repassar erros 4xx ao cliente (sem retry e sem acionar circuit breaker) — ver `ProxyService`, `RetryService` e `CircuitBreakerService`.
+
+#### Estrutura a criar
+
+```
+api-gateway/src/users/
+├── users.module.ts          # (novo) importa ProxyModule, declara UsersController
+└── users.controller.ts      # (novo) roteia /auth/* e /users/* via ProxyService
+```
+
+O `UsersModule` deve ser importado no `AppModule` do gateway.
+
+#### Tabela de rotas
+
+| Rota no Gateway          | Método | Autenticação | Implementação no UsersController                                                                                   |
+|--------------------------|--------|--------------|--------------------------------------------------------------------------------------------------------------------|
+| `/auth/register`         | POST   | Pública      | `proxyService.proxyRequest('users', 'POST', '/auth/register', body)`                                               |
+| `/auth/login`            | POST   | Pública      | `proxyService.proxyRequest('users', 'POST', '/auth/login', body)`                                                  |
+| `/auth/validate-token`   | GET    | Protegida    | `proxyService.proxyRequest('users', 'GET', '/auth/validate-token', undefined, { authorization }, user)`             |
+| `/users/profile`         | GET    | Protegida    | `proxyService.proxyRequest('users', 'GET', '/users/profile', undefined, { authorization }, user)`                   |
+| `/users/sellers`         | GET    | Protegida    | `proxyService.proxyRequest('users', 'GET', '/users/sellers', undefined, { authorization }, user)`                   |
+| `/users/:id`             | GET    | Protegida    | `proxyService.proxyRequest('users', 'GET', '/users/${id}', undefined, { authorization }, user)`                     |
+
+**Regras:**
+
+- Rotas públicas (`POST /auth/register`, `POST /auth/login`): **não** usar guards de autenticação, encaminhar apenas o body
+- Rotas protegidas (`GET /auth/validate-token`, `GET /users/profile`, `GET /users/sellers`, `GET /users/:id`): usar `@UseGuards(JwtAuthGuard)`, repassar header `Authorization` e `userInfo` (via `@CurrentUser()`) para que o `ProxyService` inclua os headers `x-user-id`, `x-user-email`, `x-user-role`
+- O controller deve usar dois prefixos separados — um `@Controller('auth')` e outro `@Controller('users')` — ou um único controller sem prefixo com rotas explícitas. A abordagem recomendada é criar **dois controllers** no mesmo módulo (`AuthProxyController` com prefixo `auth` e `UsersProxyController` com prefixo `users`), mantendo consistência com o padrão de prefixo único por controller do NestJS
+
+### RF-06: Remoção do AuthController e AuthService legados
+
+O `AuthController` (`api-gateway/src/auth/controllers/auth.controller.ts`) e o `AuthService` (`api-gateway/src/auth/service/auth.service.ts`) devem ser **removidos**, pois o fluxo de proxy via `UsersController` substitui completamente as chamadas HTTP diretas.
+
+**Itens a remover ou refatorar:**
+
+| Arquivo | Ação |
+|---------|------|
+| `api-gateway/src/auth/controllers/auth.controller.ts` | Remover (substituído pelo novo controller de proxy) |
+| `api-gateway/src/auth/service/auth.service.ts` | Remover os métodos `login()` e `register()` que fazem chamadas HTTP diretas. Manter `validateJwtToken()` e `validateSessionToken()` se ainda forem usados pelos guards/strategies |
+| `api-gateway/src/auth/auth.module.ts` | Atualizar para refletir as remoções |
+| `api-gateway/src/auth/dtos/login.dto.ts` | Pode ser removido (o gateway não precisa mais validar DTOs de login, apenas repassa o body) |
+| `api-gateway/src/auth/dtos/register.dto.ts` | Pode ser removido (mesma razão) |
+
+**Nota:** O `AuthModule` continua necessário para fornecer `JwtStrategy`, `JwtAuthGuard`, decorators (`@Public()`, `@CurrentUser()`, `@Roles()`) e o `AuthService.validateJwtToken()` usado pelo `JwtStrategy`. Apenas o controller e os métodos de chamada HTTP direta devem ser removidos.
+
+### RF-07: Repasse do Header Authorization
 
 O header `Authorization: Bearer <token>` enviado pelo cliente ao gateway deve ser repassado integralmente nas requisições proxy ao `users-service`, para que o `JwtAuthGuard` do users-service possa validar o token.
 
-**Status:** O `ProxyService` já repassa headers — verificar que o `Authorization` está incluso.
+**Status:** O `ProxyService` já repassa headers via parâmetro — o novo `UsersController` deve utilizar `@Headers('authorization')` e repassar no objeto `headers`.
 
 ---
 
 ## 5. Fluxo Completo Esperado via Gateway (porta 3005)
+
+O fluxo E2E deve funcionar inteiramente através do gateway. O consumidor (frontend, curl, Postman) **nunca** acessa o users-service diretamente. Todas as requisições passam pelo `ProxyService`, que garante resiliência (circuit breaker, retry, timeout) e repasse fiel de erros 4xx.
 
 ### 5.1 Registro de Usuário
 
 ```
 Cliente → POST http://localhost:3005/auth/register (body com dados do usuário)
        → Gateway recebe (rota pública, sem autenticação)
-       → Proxy encaminha para http://localhost:3000/auth/register
+       → UsersController chama ProxyService.proxyRequest('users', 'POST', '/auth/register', body)
+       → ProxyService encaminha para http://localhost:3000/auth/register
        → users-service registra o usuário no banco
        → Resposta retorna ao cliente via gateway (201 Created)
+       → Se email duplicado: users-service retorna 409 → ProxyService repassa 409 ao cliente
 ```
 
 ### 5.2 Login
@@ -188,9 +246,11 @@ Cliente → POST http://localhost:3005/auth/register (body com dados do usuário
 ```
 Cliente → POST http://localhost:3005/auth/login (body com email e password)
        → Gateway recebe (rota pública, sem autenticação)
-       → Proxy encaminha para http://localhost:3000/auth/login
+       → UsersController chama ProxyService.proxyRequest('users', 'POST', '/auth/login', body)
+       → ProxyService encaminha para http://localhost:3000/auth/login
        → users-service valida credenciais e gera token JWT
        → Resposta com token retorna ao cliente via gateway (200 OK)
+       → Se credenciais inválidas: users-service retorna 401 → ProxyService repassa 401 ao cliente (com body original)
 ```
 
 ### 5.3 Consulta de Perfil (rota protegida)
@@ -198,7 +258,8 @@ Cliente → POST http://localhost:3005/auth/login (body com email e password)
 ```
 Cliente → GET http://localhost:3005/users/profile (header Authorization: Bearer <token>)
        → Gateway recebe e valida o token JWT via JwtAuthGuard
-       → Proxy encaminha para http://localhost:3000/users/profile (com header Authorization)
+       → UsersController chama ProxyService.proxyRequest('users', 'GET', '/users/profile', undefined, { authorization }, userInfo)
+       → ProxyService encaminha para http://localhost:3000/users/profile (com header Authorization + x-user-*)
        → users-service valida o token novamente via seu próprio JwtAuthGuard
        → users-service busca dados do usuário no banco e retorna
        → Resposta retorna ao cliente via gateway (200 OK)
@@ -209,7 +270,8 @@ Cliente → GET http://localhost:3005/users/profile (header Authorization: Beare
 ```
 Cliente → GET http://localhost:3005/users/sellers (header Authorization: Bearer <token>)
        → Gateway recebe e valida o token JWT via JwtAuthGuard
-       → Proxy encaminha para http://localhost:3000/users/sellers (com header Authorization)
+       → UsersController chama ProxyService.proxyRequest('users', 'GET', '/users/sellers', undefined, { authorization }, userInfo)
+       → ProxyService encaminha para http://localhost:3000/users/sellers (com header Authorization + x-user-*)
        → users-service valida o token e retorna lista de vendedores ativos
        → Resposta retorna ao cliente via gateway (200 OK)
 ```
@@ -218,8 +280,9 @@ Cliente → GET http://localhost:3005/users/sellers (header Authorization: Beare
 
 ```
 Cliente → GET http://localhost:3005/auth/validate-token (header Authorization: Bearer <token>)
-       → Gateway recebe e valida o token JWT
-       → Proxy encaminha para http://localhost:3000/auth/validate-token (com header Authorization)
+       → Gateway recebe e valida o token JWT via JwtAuthGuard
+       → UsersController chama ProxyService.proxyRequest('users', 'GET', '/auth/validate-token', undefined, { authorization }, userInfo)
+       → ProxyService encaminha para http://localhost:3000/auth/validate-token (com header Authorization)
        → users-service valida o token e retorna { userId, email, role }
        → Resposta retorna ao cliente via gateway (200 OK)
 ```
@@ -266,7 +329,35 @@ Quando o token JWT está ausente, expirado ou inválido:
 }
 ```
 
-### 6.4 Erros de Proxy via Gateway — 503 Service Unavailable
+### 6.4 `POST /auth/register` — 409 Conflict (email duplicado)
+
+Quando o email já está cadastrado, o `users-service` retorna 409 e o gateway repassa fielmente:
+
+```json
+{
+  "statusCode": 409,
+  "message": "Email already exists",
+  "error": "Conflict"
+}
+```
+
+### 6.5 `POST /auth/login` — 401 Unauthorized (credenciais inválidas)
+
+Quando as credenciais são inválidas, o `users-service` retorna 401 e o gateway repassa fielmente:
+
+```json
+{
+  "statusCode": 401,
+  "message": "Invalid credentials",
+  "error": "Unauthorized"
+}
+```
+
+### 6.6 Erros 4xx genéricos — Repasse fiel
+
+Qualquer resposta 4xx do `users-service` (400, 401, 403, 404, 409, 422, etc.) é repassada pelo `ProxyService` ao cliente com o **mesmo status code e body**, sem transformação. O circuit breaker e o retry **não** são acionados por erros 4xx.
+
+### 6.7 Erros de Proxy via Gateway — 503 Service Unavailable
 
 Quando o `users-service` está fora do ar e o circuit breaker do gateway é acionado:
 
@@ -292,9 +383,29 @@ users-service/
     │   └── health.controller.ts        # (novo) endpoint GET /health
     └── auth/
         └── auth.controller.ts          # (alterado) adicionar endpoint GET /auth/validate-token
-```
 
-O api-gateway **não** requer alterações de código — apenas verificação de configuração e funcionamento.
+api-gateway/
+└── src/
+    ├── app.module.ts                        # (alterado) importar UsersModule
+    ├── users/
+    │   ├── users.module.ts                  # (novo) importa ProxyModule, declara controllers
+    │   └── users.controller.ts              # (novo) roteia /auth/* e /users/* via ProxyService
+    └── auth/
+        ├── controllers/
+        │   └── auth.controller.ts           # (removido) substituído pelo novo controller de proxy
+        ├── service/
+        │   └── auth.service.ts              # (alterado) remover métodos login() e register()
+        ├── auth.module.ts                   # (alterado) remover AuthController, atualizar providers
+        ├── dtos/
+        │   ├── login.dto.ts                 # (removido) não mais necessário
+        │   └── register.dto.ts              # (removido) não mais necessário
+        ├── strategies/
+        │   └── jwt.strategy.ts              # (inalterado)
+        └── decorators/                      # (inalterado)
+            ├── current-user.decorator.ts
+            ├── public.decorator.ts
+            └── roles.decorator.ts
+```
 
 ---
 
@@ -319,15 +430,18 @@ O api-gateway **não** requer alterações de código — apenas verificação d
 - [ ] O Swagger deve listar todos os endpoints: `/auth/register`, `/auth/login`, `/auth/validate-token`, `/users/profile`, `/users/sellers`, `/users/:id`, `/health`
 - [ ] O Swagger deve ter suporte a Bearer Auth para testar endpoints protegidos
 
-### CA-04: Registro via gateway funciona
+### CA-04: Registro via gateway funciona (com repasse fiel de erros)
 
 - [ ] Enviar `POST http://localhost:3005/auth/register` com body válido deve registrar o usuário e retornar `201 Created`
 - [ ] Os dados devem ser persistidos no banco do `users-service`
+- [ ] Enviar `POST http://localhost:3005/auth/register` com email **já cadastrado** deve retornar `409 Conflict` (não `401` genérico)
+- [ ] O body da resposta 409 deve conter a mensagem original do `users-service` (ex: `"Email already exists"`)
 
-### CA-05: Login via gateway funciona
+### CA-05: Login via gateway funciona (com repasse fiel de erros)
 
 - [ ] Enviar `POST http://localhost:3005/auth/login` com credenciais válidas deve retornar `200` com o token JWT
 - [ ] O token retornado deve ser utilizável nos próximos requests
+- [ ] Enviar `POST http://localhost:3005/auth/login` com credenciais **inválidas** deve retornar `401 Unauthorized` com a mensagem original do `users-service` (não uma mensagem genérica do gateway)
 
 ### CA-06: Consulta de perfil via gateway funciona
 
@@ -357,15 +471,37 @@ O api-gateway **não** requer alterações de código — apenas verificação d
 - [ ] O `JWT_SECRET` configurado no `.env` do `api-gateway` deve ser o **mesmo** valor configurado no `.env` do `users-service`
 - [ ] Se os secrets forem diferentes, o gateway não conseguirá validar tokens emitidos pelo `users-service`
 
-### CA-11: Testes automatizados passam
+### CA-11: Erros 4xx do users-service são repassados corretamente
 
-- [ ] Devem existir testes unitários para o novo endpoint `GET /auth/validate-token`
-- [ ] Devem existir testes unitários para o `HealthController`
+- [ ] Erros 4xx retornados pelo `users-service` (400, 401, 403, 404, 409, 422) são repassados ao cliente com o **mesmo status code e body**
+- [ ] O circuit breaker **não** é acionado por erros 4xx
+- [ ] O retry **não** é executado para erros 4xx
+- [ ] Erros 5xx e falhas de conexão continuam acionando o pipeline de resiliência normalmente
+
+### CA-12: AuthController e AuthService legados removidos
+
+- [ ] O `AuthController` antigo do gateway (que fazia chamadas HTTP diretas) foi removido
+- [ ] Os métodos `login()` e `register()` do `AuthService` foram removidos
+- [ ] O `AuthService.validateJwtToken()` e `validateSessionToken()` permanecem disponíveis para uso pelos guards/strategies
+- [ ] Todas as rotas `/auth/*` e `/users/*` no gateway passam pelo `ProxyService`
+
+### CA-13: Compatibilidade de rotas mantida
+
+- [ ] Os mesmos paths, métodos HTTP e formato de resposta existentes continuam funcionando para o consumidor
+- [ ] `POST /auth/register`, `POST /auth/login`, `GET /auth/validate-token` funcionam como antes
+- [ ] `GET /users/profile`, `GET /users/sellers`, `GET /users/:id` funcionam como antes
+- [ ] Nenhuma rota foi removida ou teve seu path alterado
+
+### CA-14: Testes automatizados passam
+
+- [ ] Devem existir testes unitários para o novo endpoint `GET /auth/validate-token` no users-service
+- [ ] Devem existir testes unitários para o `HealthController` no users-service
 - [ ] `npm run test` no `users-service` deve executar todos os testes sem falhas
 
-### CA-12: Lint passa sem erros
+### CA-15: Lint passa sem erros
 
 - [ ] Executar `npm run lint` no `users-service` não deve apresentar erros nos arquivos criados ou alterados
+- [ ] Executar `npm run lint` no `api-gateway` não deve apresentar erros nos arquivos criados ou alterados
 
 ---
 
@@ -375,30 +511,47 @@ Sequência de comandos para validar o fluxo completo passando pelo gateway:
 
 ```bash
 # 1. Registrar um usuário
-curl -X POST http://localhost:3005/auth/register \
+curl -s -w "\n%{http_code}" -X POST http://localhost:3005/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"test@email.com","password":"Str0ng!Pass","firstName":"Test","lastName":"User","role":"seller"}'
+# → Esperado: 201 Created
 
-# 2. Fazer login e obter token
-curl -X POST http://localhost:3005/auth/login \
+# 2. Tentar registrar com mesmo email (deve retornar 409, NÃO 401)
+curl -s -w "\n%{http_code}" -X POST http://localhost:3005/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@email.com","password":"Str0ng!Pass","firstName":"Test","lastName":"User","role":"seller"}'
+# → Esperado: 409 Conflict com mensagem do users-service
+
+# 3. Fazer login e obter token
+curl -s -w "\n%{http_code}" -X POST http://localhost:3005/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"test@email.com","password":"Str0ng!Pass"}'
-# → Guardar o token retornado
+# → Esperado: 200 OK com access_token — Guardar o token retornado
 
-# 3. Validar o token
-curl http://localhost:3005/auth/validate-token \
+# 4. Tentar login com credenciais inválidas (deve retornar 401 do users-service)
+curl -s -w "\n%{http_code}" -X POST http://localhost:3005/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@email.com","password":"WrongPass"}'
+# → Esperado: 401 Unauthorized com mensagem original do users-service
+
+# 5. Validar o token
+curl -s -w "\n%{http_code}" http://localhost:3005/auth/validate-token \
   -H "Authorization: Bearer <TOKEN>"
+# → Esperado: 200 OK com { userId, email, role }
 
-# 4. Consultar perfil
-curl http://localhost:3005/users/profile \
+# 6. Consultar perfil
+curl -s -w "\n%{http_code}" http://localhost:3005/users/profile \
   -H "Authorization: Bearer <TOKEN>"
+# → Esperado: 200 OK com dados do usuário (sem campo password)
 
-# 5. Listar vendedores
-curl http://localhost:3005/users/sellers \
+# 7. Listar vendedores
+curl -s -w "\n%{http_code}" http://localhost:3005/users/sellers \
   -H "Authorization: Bearer <TOKEN>"
+# → Esperado: 200 OK com array de vendedores
 
-# 6. Health check do users-service
-curl http://localhost:3005/health/services/users
+# 8. Health check do users-service
+curl -s -w "\n%{http_code}" http://localhost:3005/health/services/users
+# → Esperado: 200 OK com status "healthy"
 ```
 
 Todos os comandos acima devem retornar as respostas esperadas sem erros.
@@ -407,10 +560,9 @@ Todos os comandos acima devem retornar as respostas esperadas sem erros.
 
 ## 10. Fora de Escopo
 
-- Alteração no `ProxyService` do gateway (já funcional)
 - Alteração nos guards do gateway (`JwtAuthGuard`, `RoleGuard`, `SessionGuard`)
+- Alteração no `ProxyService`, `RetryService` ou `CircuitBreakerService` (já corrigidos para repassar erros 4xx)
 - Implementação de session management
-- Criação de novos endpoints no gateway (usa proxy existente)
 - Autenticação entre microserviços (service-to-service auth)
 - Rate limiting no users-service
 - Cache de validação de token
@@ -425,7 +577,9 @@ Todos os comandos acima devem retornar as respostas esperadas sem erros.
 
 Faça um commit granular após cada item implementado nesta spec. Sugestão de sequência:
 
-1. **Commit:** Adicionar endpoint GET /auth/validate-token no AuthController
-2. **Commit:** Adicionar endpoint GET /health com HealthController
+1. **Commit:** Adicionar endpoint GET /auth/validate-token no AuthController do users-service
+2. **Commit:** Adicionar endpoint GET /health com HealthController no users-service
 3. **Commit:** Configurar Swagger/OpenAPI no users-service
-4. **Commit:** Adicionar testes unitários dos novos endpoints
+4. **Commit:** Adicionar testes unitários dos novos endpoints no users-service
+5. **Commit:** Criar UsersController e UsersModule no api-gateway com rotas via ProxyService
+6. **Commit:** Remover AuthController e métodos HTTP diretos do AuthService no api-gateway
