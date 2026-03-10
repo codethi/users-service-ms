@@ -7,6 +7,7 @@ import { databaseConfig } from './config/database.config';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { HealthController } from './health/health.controller';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { HealthController } from './health/health.controller';
       isGlobal: true,
     }),
     TypeOrmModule.forRoot(databaseConfig),
+    MetricsModule,
     UsersModule,
     AuthModule,
   ],
