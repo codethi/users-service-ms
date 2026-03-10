@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
@@ -6,8 +6,9 @@ import { AppService } from './app.service';
 import { databaseConfig } from './config/database.config';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
-import { HealthController } from './health/health.controller';
 import { MetricsModule } from './metrics/metrics.module';
+import { HttpMetricsMiddleware } from './metrics/http-metrics.middleware';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -18,8 +19,13 @@ import { MetricsModule } from './metrics/metrics.module';
     MetricsModule,
     UsersModule,
     AuthModule,
+    HealthModule,
   ],
-  controllers: [AppController, HealthController],
+  controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(HttpMetricsMiddleware).forRoutes('*');
+  }
+}
